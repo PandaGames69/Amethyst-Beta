@@ -1,10 +1,12 @@
 // Identity Autofill for Windows.
 //
 // Shows a small always-on-top window with a "Fill" button. Click the first box
-// of a form (e.g. email), then press Fill (or F9): each line of identity.txt is
-// typed into the form in order, pressing Tab between them.
+// of a form (e.g. email), then press Fill (or F9): a fresh identity is loaded
+// from the Canada Identity Panel and typed into the form in the order of the
+// lines in identity.txt, pressing Tab between them. If the panel can't be
+// reached, the values written in identity.txt are typed instead.
 //
-// Build: x86_64-w64-mingw32-gcc -O2 -municode -mwindows autofill.c -o IdentityAutofill.exe -luser32 -lgdi32 -lshell32
+// Build: x86_64-w64-mingw32-gcc -O2 -municode -mwindows autofill.c -o IdentityAutofill.exe -luser32 -lgdi32 -lshell32 -lwinhttp
 
 #define WIN32_LEAN_AND_MEAN
 #ifndef UNICODE
@@ -15,8 +17,10 @@
 #endif
 #include <windows.h>
 #include <shellapi.h>
+#include <winhttp.h>
 #include <stdio.h>
 #include <wchar.h>
+#include "panel.h"
 
 #define ID_FILL 1
 #define ID_EDIT 2
@@ -25,13 +29,19 @@
 
 #define MAX_LINES 64
 #define MAX_VALUE 512
+#define DEFAULT_PANEL L"http://localhost:8085"
 
 static const char DEFAULT_IDENTITY[] =
     "# Identity Autofill\r\n"
     "# 1. Click the FIRST box of the form (the email box).\r\n"
     "# 2. Press Fill (or F9). Press Esc to stop typing.\r\n"
     "#\r\n"
-    "# Each line below is typed in order, with Tab pressed between lines.\r\n"
+    "# Each time you press Fill, a new identity is loaded from the panel below\r\n"
+    "# and used in place of the values here. Set  panel = off  to always use\r\n"
+    "# these values. They're also used if the panel can't be reached.\r\n"
+    "panel = http://localhost:8085\r\n"
+    "#\r\n"
+    "# The lines below are typed in order, with Tab pressed between lines.\r\n"
     "# Only the text after '=' is typed. Lines starting with # are ignored.\r\n"
     "# Special keys you can use in a value:\r\n"
     "#   {tab} {space} {enter} {skip} (leave a box empty) {wait} (pause 0.5s)\r\n"
@@ -55,7 +65,10 @@ static HWND g_wnd, g_fillBtn, g_status;
 static volatile LONG g_busy;
 static WCHAR g_identityPath[MAX_PATH];
 static WCHAR g_values[MAX_LINES][MAX_VALUE];
+static int g_keys[MAX_LINES];
 static int g_count;
+static WCHAR g_panelUrl[MAX_VALUE];
+static WCHAR g_statusText[256];
 
 static void SetStatus(const WCHAR *text) { SetWindowTextW(g_status, text); }
 
@@ -85,6 +98,7 @@ static WCHAR *Trim(WCHAR *s) {
 // Reads identity.txt (UTF-8) into g_values. Returns FALSE if the file can't be read.
 static BOOL LoadIdentity(void) {
     g_count = 0;
+    lstrcpynW(g_panelUrl, DEFAULT_PANEL, MAX_VALUE);
     HANDLE f = CreateFileW(g_identityPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
     if (f == INVALID_HANDLE_VALUE) return FALSE;
     DWORD size = GetFileSize(f, NULL), read = 0;
@@ -107,10 +121,97 @@ static BOOL LoadIdentity(void) {
         if (!*line || *line == L'#') continue;
         WCHAR *eq = wcschr(line, L'=');
         if (!eq) continue;
-        lstrcpynW(g_values[g_count++], Trim(eq + 1), MAX_VALUE);
+        *eq = 0;
+        WCHAR *label = Trim(line), *value = Trim(eq + 1);
+        if (!_wcsicmp(label, L"panel")) {
+            lstrcpynW(g_panelUrl, value, MAX_VALUE);
+            continue;
+        }
+        g_keys[g_count] = Panel_LabelKey(label);
+        lstrcpynW(g_values[g_count++], value, MAX_VALUE);
     }
     HeapFree(GetProcessHeap(), 0, wide);
     return TRUE;
+}
+
+// GETs a URL; returns the body as a heap-allocated wide string, or NULL.
+static WCHAR *HttpGet(const WCHAR *url) {
+    URL_COMPONENTS uc = {0};
+    WCHAR host[256], path[1024];
+    uc.dwStructSize = sizeof uc;
+    uc.lpszHostName = host; uc.dwHostNameLength = 256;
+    uc.lpszUrlPath = path; uc.dwUrlPathLength = 1024;
+    if (!WinHttpCrackUrl(url, 0, 0, &uc)) return NULL;
+    if (!path[0]) wcscpy(path, L"/");
+
+    WCHAR *result = NULL;
+    char *body = NULL;
+    DWORD len = 0;
+    HINTERNET s = WinHttpOpen(L"IdentityAutofill/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, 0);
+    HINTERNET c = s ? WinHttpConnect(s, host, uc.nPort, 0) : NULL;
+    HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", path, NULL, NULL, NULL,
+                                         uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0) : NULL;
+    if (s) WinHttpSetTimeouts(s, 3000, 3000, 3000, 5000);
+    if (r && WinHttpSendRequest(r, L"Accept: application/json, text/html;q=0.9, */*;q=0.8\r\n", (DWORD)-1, NULL, 0, 0, 0) &&
+        WinHttpReceiveResponse(r, NULL)) {
+        DWORD status = 0, sz = sizeof status;
+        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, NULL, &status, &sz, NULL);
+        if (status == 200) {
+            DWORD avail;
+            while (WinHttpQueryDataAvailable(r, &avail) && avail && len < 4 * 1024 * 1024) {
+                char *grown = body ? HeapReAlloc(GetProcessHeap(), 0, body, len + avail + 1) : HeapAlloc(GetProcessHeap(), 0, avail + 1);
+                if (!grown) break;
+                body = grown;
+                DWORD got = 0;
+                if (!WinHttpReadData(r, body + len, avail, &got) || !got) break;
+                len += got;
+            }
+        }
+    }
+    if (body) {
+        body[len] = 0;
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, body, -1, NULL, 0);
+        result = HeapAlloc(GetProcessHeap(), 0, wlen * sizeof(WCHAR));
+        MultiByteToWideChar(CP_UTF8, 0, body, -1, result, wlen);
+        HeapFree(GetProcessHeap(), 0, body);
+    }
+    if (r) WinHttpCloseHandle(r);
+    if (c) WinHttpCloseHandle(c);
+    if (s) WinHttpCloseHandle(s);
+    return result;
+}
+
+// Loads a fresh identity from the panel and swaps it into g_values.
+// Returns TRUE if the panel was used.
+static BOOL LoadFromPanel(void) {
+    if (!g_panelUrl[0] || !_wcsicmp(g_panelUrl, L"off")) return FALSE;
+    static const WCHAR *paths[] = {L"", L"/api/identity", L"/identity", L"/api/generate", L"/generate", L"/api", L"/random"};
+    WCHAR base[MAX_VALUE], url[MAX_VALUE + 32];
+    lstrcpynW(base, g_panelUrl, MAX_VALUE);
+    size_t n = wcslen(base);
+    while (n && base[n - 1] == L'/') base[--n] = 0;
+
+    PanelData d;
+    for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
+        swprintf(url, MAX_VALUE + 32, L"%ls%ls", base, paths[i]);
+        WCHAR *body = HttpGet(url);
+        if (!body) {
+            if (i == 0) return FALSE;  // panel isn't running at all
+            continue;
+        }
+        int found = Panel_Parse(&d, body);
+        HeapFree(GetProcessHeap(), 0, body);
+        if (found < 3) continue;
+
+        for (int k = 0; k < g_count; k++) {
+            WCHAR v[MAX_VALUE];
+            Panel_Format(&d, g_keys[k], v, MAX_VALUE);
+            if (v[0]) lstrcpynW(g_values[k], v, MAX_VALUE);
+        }
+        swprintf(g_statusText, 256, L"Loaded %ls %ls from panel. Typing... (Esc stops)", d.v[K_FIRST], d.v[K_LAST]);
+        return TRUE;
+    }
+    return FALSE;
 }
 
 static BOOL Aborted(void) { return (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0; }
@@ -158,6 +259,8 @@ static BOOL TypeValue(const WCHAR *v) {
 
 static DWORD WINAPI FillThread(LPVOID arg) {
     (void)arg;
+    if (!LoadFromPanel()) wcscpy(g_statusText, L"Panel not found; typing identity.txt... (Esc stops)");
+    SetStatus(g_statusText);
     // Let the mouse click / F9 key finish so it doesn't land in the form.
     while ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) || (GetAsyncKeyState(VK_F9) & 0x8000)) Sleep(20);
     Sleep(150);
@@ -183,7 +286,7 @@ static void StartFill(void) {
         g_busy = 0;
         return;
     }
-    SetStatus(L"Typing... (Esc to stop)");
+    SetStatus(L"Loading identity from panel...");
     EnableWindow(g_fillBtn, FALSE);
     CloseHandle(CreateThread(NULL, 0, FillThread, NULL, 0, NULL));
 }

@@ -21,10 +21,14 @@ The panel response can be JSON (`{"firstName": "...", "postalCode": "...", ...}`
 
 1. Run `IdentityAutofill.exe`. It creates `identity.txt` next to itself the first time.
 2. Click the first box of the form (the email box).
-3. Press **Fill** (or **F9**). It types each value from `identity.txt` in order, pressing Tab between them. Press **Esc** to stop.
+3. Press **Fill** (or **F9**). It loads a fresh identity from the Canada Identity Panel (`http://localhost:8085`) and types it in, pressing Tab between boxes. Press **Esc** to stop.
 
-Press **Edit** to change the details in Notepad. Lines are typed top to bottom, so they must match the form's Tab order. You can use `{tab}`, `{space}`, `{enter}`, `{skip}` and `{wait}` in a value; for example `gender = {tab}{space}` picks Female instead of Male.
+The status line shows which identity was loaded. If the panel isn't running, it types the values written in `identity.txt` instead.
+
+`identity.txt` controls the order: its lines are typed top to bottom, so they must match the form's Tab order. Each line's label (`email`, `first name`, `postal code`, `birth month`, `gender`, ...) decides which panel value goes there. Change `panel = ...` to point at another address, or set `panel = off` to always use the file's values. You can use `{tab}`, `{space}`, `{enter}`, `{skip}` and `{wait}` in a value.
+
+The panel response can be JSON, an HTML page, or `Label: value` text; the exe tries the panel's root URL and then `/api/identity`, `/identity`, `/api/generate`, `/generate`, `/api` and `/random`.
 
 Rebuild from source with MinGW:
 
-    x86_64-w64-mingw32-gcc -O2 -municode -mwindows -s windows/autofill.c -o windows/IdentityAutofill.exe -luser32 -lgdi32 -lshell32
+    x86_64-w64-mingw32-gcc -O2 -municode -mwindows -s windows/autofill.c -o windows/IdentityAutofill.exe -luser32 -lgdi32 -lshell32 -lwinhttp
