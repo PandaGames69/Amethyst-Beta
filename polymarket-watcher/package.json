@@ -1,0 +1,6 @@
+{
+  "name": "polymarket-watcher",
+  "private": true,
+  "type": "commonjs",
+  "scripts": { "start": "node watcher.js" }
+}
